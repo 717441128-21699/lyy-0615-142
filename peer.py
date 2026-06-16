@@ -3,19 +3,56 @@ import threading
 import time
 import random
 import struct
+import os
 from typing import Dict, List, Optional, Set, Tuple
-from collections import defaultdict
+from collections import defaultdict, deque
 
 from protocol import *
-from piece_manager import PieceManager
+from piece_manager import PieceManager, load_torrent_file
 from tracker import TrackerClient
 
 
-BLOCK_SIZE = 16 * 1024  # 16KB per block request
+BLOCK_SIZE = 16 * 1024
 MAX_REQUESTS_PER_PEER = 5
 MAX_UNCHOKED_PEERS = 4
 CHOKE_INTERVAL = 10
 OPTIMISTIC_UNCHOKE_INTERVAL = 30
+RATE_WINDOW_SECONDS = 20
+FREE_RIDER_UPLOAD_LIMIT = 1024  # 1KB/s max upload for free-riders
+
+
+class RateMeter:
+    def __init__(self, window_seconds: int = RATE_WINDOW_SECONDS):
+        self.window_seconds = window_seconds
+        self.samples: deque = deque()
+        self.total = 0
+        self.lock = threading.Lock()
+
+    def add_bytes(self, num_bytes: int):
+        with self.lock:
+            now = time.time()
+            self.samples.append((now, num_bytes))
+            self.total += num_bytes
+            self._cleanup(now)
+
+    def _cleanup(self, now: float):
+        cutoff = now - self.window_seconds
+        while self.samples and self.samples[0][0] < cutoff:
+            _, n = self.samples.popleft()
+            self.total -= n
+
+    def get_rate(self) -> float:
+        with self.lock:
+            now = time.time()
+            self._cleanup(now)
+            if not self.samples:
+                return 0.0
+            timespan = max(1.0, now - self.samples[0][0])
+            return self.total / timespan
+
+    def get_total(self) -> int:
+        with self.lock:
+            return self.total
 
 
 class PeerConnection:
@@ -36,20 +73,33 @@ class PeerConnection:
         self.requested_pieces: List[tuple] = []
         self.pending_requests: Set[int] = set()
 
-        self.uploaded = 0
-        self.downloaded = 0
-
-        self.download_rate = 0.0
-        self.upload_rate = 0.0
-
-        self.last_download_time = 0
-        self.last_upload_time = 0
+        self.download_meter = RateMeter()
+        self.upload_meter = RateMeter()
 
         self.is_seed = False
-
         self.sent_handshake = False
 
+        self.free_rider_mode = False
+        self.upload_quota_start = time.time()
+        self.upload_quota_used = 0
+
         self.lock = threading.Lock()
+
+    @property
+    def downloaded(self) -> int:
+        return self.download_meter.get_total()
+
+    @property
+    def uploaded(self) -> int:
+        return self.upload_meter.get_total()
+
+    @property
+    def download_rate(self) -> float:
+        return self.download_meter.get_rate()
+
+    @property
+    def upload_rate(self) -> float:
+        return self.upload_meter.get_rate()
 
     def send_data(self, data: bytes):
         with self.lock:
@@ -80,8 +130,20 @@ class PeerConnection:
         self.send_message(MSG_REQUEST, payload)
 
     def send_piece(self, piece_index: int, begin: int, data: bytes):
+        if self.free_rider_mode:
+            now = time.time()
+            if now - self.upload_quota_start > 1:
+                self.upload_quota_start = now
+                self.upload_quota_used = 0
+            if self.upload_quota_used + len(data) > FREE_RIDER_UPLOAD_LIMIT:
+                return
+
         payload = struct.pack(">II", piece_index, begin) + data
         self.send_message(MSG_PIECE, payload)
+        self.upload_meter.add_bytes(len(data))
+
+        if self.free_rider_mode:
+            self.upload_quota_used += len(data)
 
     def send_interested(self):
         self.send_message(MSG_INTERESTED)
@@ -104,7 +166,7 @@ class PeerConnection:
 
     def recv_some(self) -> bool:
         try:
-            data = self.sock.recv(4096)
+            data = self.sock.recv(65536)
             if not data:
                 return False
             self.buffer += data
@@ -148,7 +210,7 @@ class PeerConnection:
                     messages.append((MSG_REQUEST, (piece_idx, begin, length)))
                 elif msg_type == MSG_PIECE:
                     piece_idx, begin, data = decode_piece(payload)
-                    self.downloaded += len(data)
+                    self.download_meter.add_bytes(len(data))
                     messages.append((MSG_PIECE, (piece_idx, begin, data)))
                 elif msg_type == MSG_INTERESTED:
                     self.peer_interested = True
@@ -176,12 +238,14 @@ class PeerConnection:
 
 class Peer:
     def __init__(self, host: str, port: int, peer_id: bytes = None,
-                 download_dir: str = "./downloads", tracker_url: str = None):
+                 download_dir: str = "./downloads", tracker_url: str = None,
+                 free_rider: bool = False):
         self.host = host
         self.port = port
         self.peer_id = peer_id or generate_peer_id()
         self.download_dir = download_dir
         self.tracker_url = tracker_url
+        self.free_rider_mode = free_rider
 
         self.piece_manager: Optional[PieceManager] = None
         self.torrent_info: Optional[TorrentInfo] = None
@@ -193,10 +257,10 @@ class Peer:
         self.running = False
 
         self.server_thread: Optional[threading.Thread] = None
-        self.handler_threads: List[threading.Thread] = []
+        self.main_loop_thread: Optional[threading.Thread] = None
 
-        self.download_total = 0
-        self.upload_total = 0
+        self.download_meter = RateMeter()
+        self.upload_meter = RateMeter()
 
         self.unchoked_peers: Set[bytes] = set()
         self.optimistic_peer: Optional[bytes] = None
@@ -211,6 +275,32 @@ class Peer:
         self.seed_after_complete = True
         self.completed_callback = None
         self.progress_callback = None
+        self.status_callback = None
+
+        self.start_time = 0
+
+    @classmethod
+    def from_torrent_file(cls, torrent_filepath: str, host: str = '127.0.0.1',
+                          port: int = 0, download_dir: str = "./downloads",
+                          source_filepath: str = None, seed: bool = False,
+                          free_rider: bool = False) -> 'Peer':
+        torrent_info, tracker_url = load_torrent_file(torrent_filepath)
+        peer = cls(host=host, port=port, download_dir=download_dir,
+                   tracker_url=tracker_url, free_rider=free_rider)
+
+        peer.piece_manager = PieceManager(
+            torrent_info=torrent_info,
+            download_dir=download_dir,
+            source_filepath=source_filepath,
+            fast_resume=(not seed)
+        )
+        peer.torrent_info = torrent_info
+
+        if seed and not source_filepath:
+            for i in range(torrent_info.num_pieces):
+                peer.piece_manager.bitfield.set_piece(i, True)
+
+        return peer
 
     def load_torrent(self, torrent_info: TorrentInfo, seed: bool = False):
         self.torrent_info = torrent_info
@@ -224,8 +314,20 @@ class Peer:
         self.piece_manager = PieceManager.from_existing_file(filepath, self.download_dir)
         self.torrent_info = self.piece_manager.torrent_info
 
+    def pause(self):
+        if self.piece_manager:
+            self.piece_manager.clear_all_requested()
+        with self.lock:
+            for conn in self.connections.values():
+                conn.requested_pieces.clear()
+                conn.pending_requests.clear()
+
+    def resume(self):
+        pass
+
     def start(self):
         self.running = True
+        self.start_time = time.time()
 
         self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -233,16 +335,29 @@ class Peer:
         self.server_sock.listen(50)
         self.server_sock.settimeout(1.0)
 
+        if self.free_rider_mode:
+            print(f"⚠ Free-rider mode: upload limited to {FREE_RIDER_UPLOAD_LIMIT}B/s")
+
         self.server_thread = threading.Thread(target=self._accept_loop, daemon=True)
         self.server_thread.start()
 
-        self._main_loop_thread = threading.Thread(target=self._main_loop, daemon=True)
-        self._main_loop_thread.start()
+        self.main_loop_thread = threading.Thread(target=self._main_loop, daemon=True)
+        self.main_loop_thread.start()
 
-        print(f"Peer {self.peer_id.hex()[:8]} started on {self.host}:{self.port}")
+        port = self.get_listen_port()
+        if self.piece_manager and self.piece_manager.is_complete():
+            prog_str = f"{self.piece_manager.num_pieces}/{self.piece_manager.num_pieces} (seeding)"
+        elif self.piece_manager:
+            d, t = self.piece_manager.progress()
+            prog_str = f"{d}/{t}"
+        else:
+            prog_str = "?"
+        print(f"▶ Peer {self.peer_id.hex()[:8]} started on {self.host}:{port} | {prog_str}")
 
     def stop(self):
         self.running = False
+        self.pause()
+
         if self.server_sock:
             try:
                 self.server_sock.close()
@@ -255,6 +370,7 @@ class Peer:
             self.connections.clear()
 
         self._announce_to_tracker("stopped")
+        print(f"⏹ Peer {self.peer_id.hex()[:8]} stopped")
 
     def connect_to_peer(self, ip: str, port: int) -> Optional[PeerConnection]:
         addr_key = f"{ip}:{port}"
@@ -269,6 +385,7 @@ class Peer:
             sock.settimeout(None)
 
             conn = PeerConnection(sock, addr=(ip, port))
+            conn.free_rider_mode = self.free_rider_mode
             conn.send_handshake(self.torrent_info.info_hash, self.peer_id)
 
             t = threading.Thread(target=self._handle_connection, args=(conn,), daemon=True)
@@ -276,7 +393,6 @@ class Peer:
 
             return conn
         except Exception as e:
-            print(f"Failed to connect to {ip}:{port}: {e}")
             return None
 
     def _accept_loop(self):
@@ -284,6 +400,7 @@ class Peer:
             try:
                 client_sock, addr = self.server_sock.accept()
                 conn = PeerConnection(client_sock, addr=addr)
+                conn.free_rider_mode = self.free_rider_mode
 
                 t = threading.Thread(target=self._handle_connection, args=(conn,), daemon=True)
                 t.start()
@@ -314,9 +431,9 @@ class Peer:
                     try:
                         self._handle_message(conn, msg_type, data)
                     except Exception as e:
-                        print(f"Error handling message {msg_type}: {e}")
-        except Exception as e:
-            print(f"Connection handler error: {e}")
+                        pass
+        except Exception:
+            pass
         finally:
             self._remove_connection(conn)
 
@@ -331,7 +448,8 @@ class Peer:
                 return
 
             conn.send_handshake(self.torrent_info.info_hash, self.peer_id)
-            conn.send_bitfield(self.piece_manager.bitfield)
+            if self.piece_manager:
+                conn.send_bitfield(self.piece_manager.bitfield)
 
             with self.lock:
                 self.connections[peer_id] = conn
@@ -347,7 +465,7 @@ class Peer:
         elif msg_type == MSG_BITFIELD:
             bf = data
             conn.bitfield = bf
-            if self.piece_manager:
+            if self.piece_manager and conn.peer_id:
                 self.piece_manager.remove_peer(conn.peer_id)
                 self.piece_manager.add_peer(conn.peer_id, bf)
 
@@ -363,7 +481,7 @@ class Peer:
                 self._check_interested(conn)
 
         elif msg_type == MSG_INTERESTED:
-            pass
+            self._update_choke(force=True)
 
         elif msg_type == MSG_NOT_INTERESTED:
             pass
@@ -385,8 +503,7 @@ class Peer:
                 if piece_data:
                     block_data = piece_data[begin:begin + length]
                     conn.send_piece(piece_idx, begin, block_data)
-                    conn.uploaded += len(block_data)
-                    self.upload_total += len(block_data)
+                    self.upload_meter.add_bytes(len(block_data))
 
         elif msg_type == MSG_PIECE:
             piece_idx, begin, data = data
@@ -396,10 +513,10 @@ class Peer:
                 if not (r[0] == piece_idx and r[1] == begin)
             ]
             conn.pending_requests.discard(piece_idx)
+            self.download_meter.add_bytes(len(data))
 
             if self.piece_manager:
                 completed = self.piece_manager.receive_block(piece_idx, begin, data)
-                self.download_total += len(data)
 
                 if completed:
                     self._broadcast_have(piece_idx)
@@ -480,10 +597,10 @@ class Peer:
             if self.optimistic_peer == conn.peer_id:
                 self.optimistic_peer = None
 
-    def _update_choke(self):
+    def _update_choke(self, force: bool = False):
         now = time.time()
 
-        if now - self.last_choke_update < CHOKE_INTERVAL:
+        if not force and now - self.last_choke_update < CHOKE_INTERVAL:
             return
         self.last_choke_update = now
 
@@ -500,16 +617,21 @@ class Peer:
                     self.unchoked_peers.add(peer_id)
             return
 
-        peers_with_rate = []
-        for peer_id, conn in interested_peers:
-            if conn.upload_rate > 0 or peer_id == self.optimistic_peer:
-                peers_with_rate.append((conn.upload_rate, peer_id, conn))
+        is_seed = self.piece_manager and self.piece_manager.is_complete()
 
-        peers_with_rate.sort(key=lambda x: -x[0])
+        peers_with_score = []
+        for peer_id, conn in interested_peers:
+            if is_seed:
+                score = conn.upload_rate if conn.upload_rate > 0 else 0.01
+            else:
+                score = conn.download_rate if conn.download_rate > 0 else 0.01
+            peers_with_score.append((score, peer_id, conn))
+
+        peers_with_score.sort(key=lambda x: (-x[0], random.random()))
 
         new_unchoked = set()
         count = 0
-        for rate, peer_id, conn in peers_with_rate:
+        for score, peer_id, conn in peers_with_score:
             if count >= MAX_UNCHOKED_PEERS - 1:
                 break
             if conn.am_choking:
@@ -543,15 +665,6 @@ class Peer:
 
         self.unchoked_peers = new_unchoked
 
-    def _update_rates(self):
-        with self.lock:
-            for conn in self.connections.values():
-                now = time.time()
-                if now - conn.last_download_time > 1:
-                    conn.download_rate = 0.0
-                if now - conn.last_upload_time > 1:
-                    conn.upload_rate = 0.0
-
     def _announce_to_tracker(self, event: str = "started"):
         if not self.tracker_url or not self.torrent_info:
             return
@@ -561,42 +674,48 @@ class Peer:
             downloaded = self.piece_manager.bitfield.count_set()
             left = (self.torrent_info.num_pieces - downloaded) * self.torrent_info.piece_size
 
-        client = TrackerClient(self.tracker_url)
-        result = client.announce(
-            info_hash=self.torrent_info.info_hash,
-            peer_id=self.peer_id,
-            port=self.get_listen_port(),
-            event=event,
-            uploaded=self.upload_total,
-            downloaded=self.download_total,
-            left=left
-        )
+        try:
+            client = TrackerClient(self.tracker_url)
+            result = client.announce(
+                info_hash=self.torrent_info.info_hash,
+                peer_id=self.peer_id,
+                port=self.get_listen_port(),
+                event=event,
+                uploaded=self.upload_meter.get_total(),
+                downloaded=self.download_meter.get_total(),
+                left=left
+            )
 
-        if 'interval' in result:
-            self.announce_interval = result['interval']
+            if 'interval' in result:
+                self.announce_interval = result['interval']
 
-        peers = result.get('peers', [])
-        for peer_info in peers:
-            ip = peer_info.get('ip', '')
-            port = peer_info.get('port', 0)
-            listen_port = self.get_listen_port()
-            if ip and port and not (ip == self.host and port == listen_port):
-                self.connect_to_peer(ip, port)
+            peers = result.get('peers', [])
+            for peer_info in peers:
+                ip = peer_info.get('ip', '')
+                port = peer_info.get('port', 0)
+                listen_port = self.get_listen_port()
+                if ip and port and not (ip == self.host and port == listen_port):
+                    self.connect_to_peer(ip, port)
+        except Exception:
+            pass
 
     def _main_loop(self):
+        first_loop = True
         try:
             while self.running:
                 time.sleep(1)
 
                 try:
-                    self._update_choke()
-                except Exception as e:
-                    print(f"Error in _update_choke: {e}")
+                    self._update_choke(force=first_loop)
+                    first_loop = False
+                except Exception:
+                    pass
 
                 try:
-                    self._update_rates()
-                except Exception as e:
-                    print(f"Error in _update_rates: {e}")
+                    if self.status_callback:
+                        self.status_callback(self.get_status())
+                except Exception:
+                    pass
 
                 try:
                     now = time.time()
@@ -606,10 +725,51 @@ class Peer:
                             self._announce_to_tracker("completed")
                         else:
                             self._announce_to_tracker("started")
-                except Exception as e:
-                    print(f"Error in tracker announce: {e}")
-        except Exception as e:
-            print(f"Main loop error: {e}")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def get_status(self) -> dict:
+        if not self.piece_manager or not self.torrent_info:
+            return {}
+
+        d, t = self.piece_manager.progress()
+        download_rate = self.download_meter.get_rate()
+        upload_rate = self.upload_meter.get_rate()
+
+        peer_stats = {}
+        with self.lock:
+            for pid, conn in self.connections.items():
+                pid_short = pid.hex()[:8]
+                peer_stats[pid_short] = {
+                    'up': conn.uploaded,
+                    'down': conn.downloaded,
+                    'up_rate': round(conn.upload_rate),
+                    'down_rate': round(conn.download_rate),
+                    'choking': conn.peer_choking,
+                    'choked': conn.am_choking,
+                    'interested': conn.peer_interested,
+                    'interesting': conn.am_interested,
+                    'is_seed': conn.is_seed,
+                }
+
+        return {
+            'peer_id': self.peer_id.hex()[:8],
+            'filename': self.torrent_info.filename,
+            'info_hash': self.torrent_info.info_hash.hex()[:16],
+            'progress': (d, t),
+            'percent': round(d / t * 100, 1) if t > 0 else 0,
+            'download_rate': round(download_rate),
+            'upload_rate': round(upload_rate),
+            'download_total': self.download_meter.get_total(),
+            'upload_total': self.upload_meter.get_total(),
+            'num_peers': len(self.connections),
+            'peers': peer_stats,
+            'is_seed': self.piece_manager.is_complete(),
+            'uptime': int(time.time() - self.start_time) if self.start_time else 0,
+            'free_rider': self.free_rider_mode
+        }
 
     def get_progress(self) -> Tuple[int, int]:
         if not self.piece_manager:

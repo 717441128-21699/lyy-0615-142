@@ -1,4 +1,5 @@
 import os
+import json
 import hashlib
 import random
 from typing import List, Dict, Set, Optional, Tuple
@@ -12,8 +13,61 @@ from protocol import (
 BLOCK_SIZE = 16 * 1024
 
 
+def save_torrent_file(torrent_info: TorrentInfo, output_path: str,
+                      tracker_url: str = None, created_by: str = "P2P v1.0"):
+    torrent_dict = {
+        'announce': tracker_url or '',
+        'created by': created_by,
+        'creation date': int(os.path.getmtime(output_path)) if os.path.exists(output_path) else int(time.time()),
+        'info': {
+            'name': torrent_info.filename,
+            'length': torrent_info.total_size,
+            'piece length': torrent_info.piece_size,
+            'pieces': [h.hex() for h in torrent_info.piece_hashes]
+        },
+        'info_hash': torrent_info.info_hash.hex()
+    }
+
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(torrent_dict, f, indent=2, ensure_ascii=False)
+
+
+def load_torrent_file(filepath: str) -> Tuple[TorrentInfo, Optional[str]]:
+    with open(filepath, 'r', encoding='utf-8') as f:
+        torrent_dict = json.load(f)
+
+    info = torrent_dict['info']
+    filename = info['name']
+    total_size = info['length']
+    piece_size = info['piece length']
+    piece_hashes = [bytes.fromhex(h) for h in info['pieces']]
+
+    info_hash = compute_info_hash(filename, total_size, piece_size, piece_hashes)
+
+    if 'info_hash' in torrent_dict:
+        stored_hash = bytes.fromhex(torrent_dict['info_hash'])
+        if stored_hash != info_hash:
+            print(f"Warning: info_hash mismatch! Recomputed: {info_hash.hex()}")
+
+    tracker_url = torrent_dict.get('announce') or None
+
+    torrent_info = TorrentInfo(
+        filename=filename,
+        total_size=total_size,
+        piece_size=piece_size,
+        piece_hashes=piece_hashes,
+        info_hash=info_hash
+    )
+
+    return torrent_info, tracker_url
+
+
+import time
+
+
 class PieceManager:
-    def __init__(self, torrent_info: TorrentInfo, download_dir: str = "./downloads"):
+    def __init__(self, torrent_info: TorrentInfo, download_dir: str = "./downloads",
+                 source_filepath: str = None, fast_resume: bool = True):
         self.torrent_info = torrent_info
         self.download_dir = download_dir
         os.makedirs(download_dir, exist_ok=True)
@@ -27,13 +81,73 @@ class PieceManager:
         self.peer_bitfields: Dict[bytes, Bitfield] = {}
         self.piece_availability: List[int] = [0] * self.num_pieces
 
+        self.source_filepath = source_filepath
         self.output_path = os.path.join(download_dir, torrent_info.filename)
-        self._init_file_storage()
+
+        if source_filepath:
+            self.output_path = source_filepath
+            self._verify_source_file()
+        else:
+            self._init_file_storage()
+            if fast_resume:
+                self._scan_existing_pieces()
 
     def _init_file_storage(self):
         if not os.path.exists(self.output_path):
             with open(self.output_path, 'wb') as f:
                 f.truncate(self.torrent_info.total_size)
+
+    def _verify_source_file(self):
+        if not os.path.exists(self.source_filepath):
+            raise FileNotFoundError(f"Source file not found: {self.source_filepath}")
+
+        actual_size = os.path.getsize(self.source_filepath)
+        if actual_size != self.torrent_info.total_size:
+            raise ValueError(f"Source file size mismatch: expected {self.torrent_info.total_size}, got {actual_size}")
+
+        print(f"Verifying source file: {self.source_filepath}")
+        all_valid = True
+        with open(self.source_filepath, 'rb') as f:
+            for i in range(self.num_pieces):
+                f.seek(i * self.torrent_info.piece_size)
+                data = f.read(self._get_piece_size(i))
+                h = hashlib.sha1(data).digest()
+                if h == self.torrent_info.piece_hashes[i]:
+                    self.bitfield.set_piece(i, True)
+                else:
+                    all_valid = False
+                    print(f"  Warning: piece {i} hash mismatch")
+
+        if all_valid:
+            print(f"  All {self.num_pieces} pieces verified ✓")
+        else:
+            valid_count = self.bitfield.count_set()
+            print(f"  {valid_count}/{self.num_pieces} pieces valid")
+
+    def _scan_existing_pieces(self):
+        if not os.path.exists(self.output_path):
+            return
+
+        actual_size = os.path.getsize(self.output_path)
+        if actual_size < self.torrent_info.total_size:
+            print(f"File incomplete ({actual_size}/{self.torrent_info.total_size} bytes), scanning...")
+
+        verified = 0
+        with open(self.output_path, 'rb') as f:
+            for i in range(self.num_pieces):
+                if self.bitfield.has_piece(i):
+                    verified += 1
+                    continue
+                f.seek(i * self.torrent_info.piece_size)
+                data = f.read(self._get_piece_size(i))
+                if len(data) == self._get_piece_size(i):
+                    h = hashlib.sha1(data).digest()
+                    if h == self.torrent_info.piece_hashes[i]:
+                        self.bitfield.set_piece(i, True)
+                        verified += 1
+
+        if verified > 0:
+            print(f"Fast resume: {verified}/{self.num_pieces} pieces already verified ✓")
 
     def add_peer(self, peer_id: bytes, bitfield: Bitfield):
         self.peer_bitfields[peer_id] = bitfield
@@ -126,7 +240,6 @@ class PieceManager:
         if piece_index not in self.received_blocks:
             return False
         received = self.received_blocks[piece_index]
-        total_bytes = sum(BLOCK_SIZE for _ in received)
         expected_size = self._get_piece_size(piece_index)
         full_blocks = expected_size // BLOCK_SIZE
         last_block_size = expected_size % BLOCK_SIZE
@@ -190,9 +303,18 @@ class PieceManager:
     def unmark_requested(self, piece_index: int):
         self.requested.discard(piece_index)
 
+    def clear_all_requested(self):
+        self.requested.clear()
+
     def progress(self) -> Tuple[int, int]:
         downloaded = self.bitfield.count_set()
         return downloaded, self.num_pieces
+
+    def progress_percent(self) -> float:
+        d, t = self.progress()
+        if t == 0:
+            return 0.0
+        return (d / t) * 100
 
     @staticmethod
     def create_torrent_from_file(filepath: str, piece_size: int = PIECE_SIZE) -> TorrentInfo:
@@ -202,6 +324,7 @@ class PieceManager:
         num_pieces = (total_size + piece_size - 1) // piece_size
         piece_hashes = []
 
+        print(f"Creating torrent for: {filename} ({total_size} bytes)")
         with open(filepath, 'rb') as f:
             for i in range(num_pieces):
                 data = f.read(piece_size)
@@ -209,6 +332,7 @@ class PieceManager:
                 piece_hashes.append(h)
 
         info_hash = compute_info_hash(filename, total_size, piece_size, piece_hashes)
+        print(f"  {num_pieces} pieces, info_hash: {info_hash.hex()[:16]}...")
         return TorrentInfo(
             filename=filename,
             total_size=total_size,
@@ -220,15 +344,27 @@ class PieceManager:
     @classmethod
     def from_existing_file(cls, filepath: str, download_dir: str = None) -> 'PieceManager':
         torrent_info = cls.create_torrent_from_file(filepath)
-        if download_dir is None:
-            download_dir = os.path.dirname(os.path.abspath(filepath))
+        return cls(
+            torrent_info=torrent_info,
+            download_dir=download_dir or os.path.dirname(os.path.abspath(filepath)),
+            source_filepath=filepath,
+            fast_resume=True
+        )
 
-        pm = cls(torrent_info, download_dir)
+    @classmethod
+    def from_torrent_file(cls, torrent_filepath: str, download_dir: str = "./downloads",
+                          source_filepath: str = None) -> Tuple['PieceManager', Optional[str]]:
+        torrent_info, tracker_url = load_torrent_file(torrent_filepath)
+        pm = cls(
+            torrent_info=torrent_info,
+            download_dir=download_dir,
+            source_filepath=source_filepath,
+            fast_resume=(source_filepath is None)
+        )
+        return pm, tracker_url
 
-        for i in range(torrent_info.num_pieces):
-            pm.bitfield.set_piece(i, True)
-
-        return pm
+    def save_torrent(self, output_path: str, tracker_url: str = None):
+        save_torrent_file(self.torrent_info, output_path, tracker_url)
 
     def get_peers_with_piece(self, piece_index: int) -> List[bytes]:
         peers = []
@@ -236,3 +372,11 @@ class PieceManager:
             if bf.has_piece(piece_index):
                 peers.append(peer_id)
         return peers
+
+    def get_rarest_pieces(self, limit: int = 10) -> List[Tuple[int, int]]:
+        result = []
+        for i in range(self.num_pieces):
+            if not self.bitfield.has_piece(i):
+                result.append((self.piece_availability[i], i))
+        result.sort(key=lambda x: x[0])
+        return result[:limit]
