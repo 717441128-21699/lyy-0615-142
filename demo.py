@@ -2,7 +2,7 @@ import os
 import sys
 import time
 import tempfile
-import shutil
+import hashlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -21,6 +21,19 @@ def create_test_file(filepath: str, size: int):
             remaining -= write_size
 
 
+def format_size(n: int) -> str:
+    if n < 1024:
+        return f"{n} B"
+    elif n < 1024 * 1024:
+        return f"{n / 1024:.1f} KB"
+    else:
+        return f"{n / (1024 * 1024):.1f} MB"
+
+
+def format_rate(rate: float) -> str:
+    return f"{format_size(int(rate))}/s"
+
+
 def main():
     print("=" * 60)
     print("P2P File Distribution Network - Demo")
@@ -37,7 +50,7 @@ def main():
     for d in [seeder_dir, leecher1_dir, leecher2_dir, leecher3_dir]:
         os.makedirs(d, exist_ok=True)
 
-    file_size = 2 * 1024 * 1024  # 2MB
+    file_size = 2 * 1024 * 1024
     test_filename = "testfile.bin"
     test_filepath = os.path.join(seeder_dir, test_filename)
     create_test_file(test_filepath, file_size)
@@ -69,7 +82,7 @@ def main():
     seeder.seed_after_complete = True
     seeder.start()
     time.sleep(0.5)
-    seeder_port = seeder.server_sock.getsockname()[1]
+    seeder_port = seeder.get_listen_port()
     print(f"Seeder ID: {seeder.peer_id.hex()[:8]}... port: {seeder_port}")
 
     print("\n" + "=" * 60)
@@ -95,7 +108,7 @@ def main():
         leecher.start()
         leechers.append((leecher, leecher_dir))
         time.sleep(0.3)
-        port = leecher.server_sock.getsockname()[1]
+        port = leecher.get_listen_port()
         print(f"  Leecher {i+1}: {leecher.peer_id.hex()[:8]}... port: {port}")
 
     print("\n" + "=" * 60)
@@ -113,11 +126,15 @@ def main():
             status_lines = []
             all_done = True
 
+            seeder_status = seeder.get_status()
             seeder_progress, seeder_total = seeder.get_progress()
+            seeder_up = seeder_status.get('upload_total', 0)
+            seeder_up_rate = seeder_status.get('upload_rate', 0)
             status_lines.append(
                 f"  [Seeder  ] {seeder_progress}/{seeder_total} pieces "
                 f"| peers: {seeder.get_num_peers()} "
-                f"| up: {seeder.upload_total // 1024}KB"
+                f"| up: {format_size(seeder_up)} "
+                f"| up-rate: {format_rate(seeder_up_rate)}"
             )
 
             for i, (leecher, _) in enumerate(leechers):
@@ -126,11 +143,16 @@ def main():
                 if not complete:
                     all_done = False
                 status = "DONE" if complete else "DOWN"
+                leecher_status = leecher.get_status()
+                down = leecher_status.get('download_total', 0)
+                up = leecher_status.get('upload_total', 0)
+                down_rate = leecher_status.get('download_rate', 0)
+                up_rate = leecher_status.get('upload_rate', 0)
                 status_lines.append(
                     f"  [Leecher{i+1}] {progress}/{total} pieces "
                     f"| peers: {leecher.get_num_peers()} "
-                    f"| down: {leecher.download_total // 1024}KB "
-                    f"| up: {leecher.upload_total // 1024}KB "
+                    f"| down: {format_size(down)} ({format_rate(down_rate)}) "
+                    f"| up: {format_size(up)} ({format_rate(up_rate)}) "
                     f"[{status}]"
                 )
 
@@ -156,7 +178,6 @@ def main():
     print("Verifying downloaded files...")
     print("=" * 60)
 
-    import hashlib
     with open(test_filepath, 'rb') as f:
         original_hash = hashlib.sha1(f.read()).hexdigest()
     print(f"Original file SHA1: {original_hash}")
@@ -182,14 +203,14 @@ def main():
         print("✗ FAILURE: Some downloads failed verification")
     print("=" * 60)
 
-    print("\nCleaning up...")
+    print("\nStopping nodes...")
     seeder.stop()
     for leecher, _ in leechers:
         leecher.stop()
     tracker.stop()
 
-    print(f"Test files in: {base_dir}")
-    print("\nDone!")
+    print(f"\nTest files in: {base_dir}")
+    print("Done!")
 
 
 if __name__ == "__main__":

@@ -14,11 +14,12 @@ from tracker import TrackerClient
 
 BLOCK_SIZE = 16 * 1024
 MAX_REQUESTS_PER_PEER = 5
-MAX_UNCHOKED_PEERS = 4
-CHOKE_INTERVAL = 10
-OPTIMISTIC_UNCHOKE_INTERVAL = 30
+MAX_UNCHOKED_PEERS = 2
+CHOKE_INTERVAL = 5
+OPTIMISTIC_UNCHOKE_INTERVAL = 5
 RATE_WINDOW_SECONDS = 20
-FREE_RIDER_UPLOAD_LIMIT = 1024  # 1KB/s max upload for free-riders
+FREE_RIDER_UPLOAD_LIMIT = 512
+DEFAULT_UPLOAD_LIMIT = 200 * 1024  # 1KB/s max upload for free-riders
 
 
 class RateMeter:
@@ -80,8 +81,7 @@ class PeerConnection:
         self.sent_handshake = False
 
         self.free_rider_mode = False
-        self.upload_quota_start = time.time()
-        self.upload_quota_used = 0
+        self.upload_limit = DEFAULT_UPLOAD_LIMIT
 
         self.lock = threading.Lock()
 
@@ -129,21 +129,13 @@ class PeerConnection:
         payload = struct.pack(">III", piece_index, begin, length)
         self.send_message(MSG_REQUEST, payload)
 
-    def send_piece(self, piece_index: int, begin: int, data: bytes):
-        if self.free_rider_mode:
-            now = time.time()
-            if now - self.upload_quota_start > 1:
-                self.upload_quota_start = now
-                self.upload_quota_used = 0
-            if self.upload_quota_used + len(data) > FREE_RIDER_UPLOAD_LIMIT:
-                return
+    def send_piece(self, piece_index: int, begin: int, data: bytes, peer=None):
+        if peer is not None:
+            peer.acquire_upload_tokens(len(data))
 
         payload = struct.pack(">II", piece_index, begin) + data
         self.send_message(MSG_PIECE, payload)
         self.upload_meter.add_bytes(len(data))
-
-        if self.free_rider_mode:
-            self.upload_quota_used += len(data)
 
     def send_interested(self):
         self.send_message(MSG_INTERESTED)
@@ -239,13 +231,14 @@ class PeerConnection:
 class Peer:
     def __init__(self, host: str, port: int, peer_id: bytes = None,
                  download_dir: str = "./downloads", tracker_url: str = None,
-                 free_rider: bool = False):
+                 free_rider: bool = False, upload_limit: int = DEFAULT_UPLOAD_LIMIT):
         self.host = host
         self.port = port
         self.peer_id = peer_id or generate_peer_id()
         self.download_dir = download_dir
         self.tracker_url = tracker_url
         self.free_rider_mode = free_rider
+        self.upload_limit = upload_limit
 
         self.piece_manager: Optional[PieceManager] = None
         self.torrent_info: Optional[TorrentInfo] = None
@@ -272,6 +265,10 @@ class Peer:
 
         self.lock = threading.Lock()
 
+        self.shared_upload_tokens = float(upload_limit)
+        self.shared_upload_last_refill = time.time()
+        self.upload_bucket_lock = threading.Lock()
+
         self.seed_after_complete = True
         self.completed_callback = None
         self.progress_callback = None
@@ -279,14 +276,37 @@ class Peer:
 
         self.start_time = 0
 
+    def acquire_upload_tokens(self, data_len: int):
+        effective_limit = self.upload_limit
+        while True:
+            with self.upload_bucket_lock:
+                now = time.time()
+                elapsed = now - self.shared_upload_last_refill
+                self.shared_upload_tokens = min(
+                    float(effective_limit * 2),
+                    self.shared_upload_tokens + elapsed * effective_limit
+                )
+                self.shared_upload_last_refill = now
+
+                if self.shared_upload_tokens >= data_len:
+                    self.shared_upload_tokens -= data_len
+                    return
+
+                deficit = data_len - self.shared_upload_tokens
+                wait_time = deficit / effective_limit
+
+            time.sleep(wait_time)
+
     @classmethod
     def from_torrent_file(cls, torrent_filepath: str, host: str = '127.0.0.1',
                           port: int = 0, download_dir: str = "./downloads",
                           source_filepath: str = None, seed: bool = False,
-                          free_rider: bool = False) -> 'Peer':
+                          free_rider: bool = False,
+                          upload_limit: int = DEFAULT_UPLOAD_LIMIT) -> 'Peer':
         torrent_info, tracker_url = load_torrent_file(torrent_filepath)
         peer = cls(host=host, port=port, download_dir=download_dir,
-                   tracker_url=tracker_url, free_rider=free_rider)
+                   tracker_url=tracker_url, free_rider=free_rider,
+                   upload_limit=upload_limit)
 
         peer.piece_manager = PieceManager(
             torrent_info=torrent_info,
@@ -502,7 +522,7 @@ class Peer:
                 piece_data = self.piece_manager.get_piece_data(piece_idx)
                 if piece_data:
                     block_data = piece_data[begin:begin + length]
-                    conn.send_piece(piece_idx, begin, block_data)
+                    conn.send_piece(piece_idx, begin, block_data, peer=self)
                     self.upload_meter.add_bytes(len(block_data))
 
         elif msg_type == MSG_PIECE:
@@ -526,6 +546,10 @@ class Peer:
                         self.progress_callback(downloaded, total)
 
                     if self.piece_manager.is_complete():
+                        with self.lock:
+                            for c in self.connections.values():
+                                if c.am_interested:
+                                    c.send_not_interested()
                         if self.completed_callback:
                             self.completed_callback()
                         if not self.seed_after_complete:
@@ -597,6 +621,14 @@ class Peer:
             if self.optimistic_peer == conn.peer_id:
                 self.optimistic_peer = None
 
+    def _is_non_contributor(self, conn: PeerConnection) -> bool:
+        elapsed = time.time() - self.start_time if self.start_time > 0 else 0
+        if elapsed < 3:
+            return False
+        if conn.downloaded < 512 and conn.download_rate < 50:
+            return True
+        return False
+
     def _update_choke(self, force: bool = False):
         now = time.time()
 
@@ -604,27 +636,54 @@ class Peer:
             return
         self.last_choke_update = now
 
+        if self.free_rider_mode:
+            return
+
         interested_peers = []
         with self.lock:
             for peer_id, conn in self.connections.items():
                 if conn.peer_interested:
                     interested_peers.append((peer_id, conn))
 
+        is_seed = self.piece_manager and self.piece_manager.is_complete()
+
+        if is_seed:
+            for peer_id, conn in interested_peers:
+                if conn.am_choking:
+                    conn.send_unchoke()
+                self.unchoked_peers.add(peer_id)
+            all_interested = {pid for pid, _ in interested_peers}
+            for peer_id in list(self.unchoked_peers):
+                if peer_id not in all_interested:
+                    conn = self.connections.get(peer_id)
+                    if conn and not conn.am_choking:
+                        conn.send_choke()
+                    self.unchoked_peers.discard(peer_id)
+            return
+
+        if not interested_peers:
+            return
+
         if len(interested_peers) <= MAX_UNCHOKED_PEERS:
             for peer_id, conn in interested_peers:
                 if conn.am_choking:
                     conn.send_unchoke()
-                    self.unchoked_peers.add(peer_id)
+                self.unchoked_peers.add(peer_id)
             return
 
-        is_seed = self.piece_manager and self.piece_manager.is_complete()
+        elapsed = now - self.start_time if self.start_time > 0 else 0
 
         peers_with_score = []
         for peer_id, conn in interested_peers:
-            if is_seed:
-                score = conn.upload_rate if conn.upload_rate > 0 else 0.01
+            if self._is_non_contributor(conn):
+                score = -1.0
             else:
-                score = conn.download_rate if conn.download_rate > 0 else 0.01
+                score = conn.download_rate
+                if score < 1.0:
+                    if elapsed > 3 and conn.downloaded < 512:
+                        score = 0.001
+                    else:
+                        score = 0.01
             peers_with_score.append((score, peer_id, conn))
 
         peers_with_score.sort(key=lambda x: (-x[0], random.random()))
@@ -632,7 +691,7 @@ class Peer:
         new_unchoked = set()
         count = 0
         for score, peer_id, conn in peers_with_score:
-            if count >= MAX_UNCHOKED_PEERS - 1:
+            if count >= MAX_UNCHOKED_PEERS:
                 break
             if conn.am_choking:
                 conn.send_unchoke()
@@ -641,23 +700,31 @@ class Peer:
 
         if now - self.last_optimistic_update >= OPTIMISTIC_UNCHOKE_INTERVAL:
             self.last_optimistic_update = now
-            candidates = [
+            remaining = [
                 (peer_id, conn) for peer_id, conn in interested_peers
                 if peer_id not in new_unchoked
             ]
-            if candidates:
-                opt_peer_id, opt_conn = random.choice(candidates)
+
+            contributors = [
+                (pid, c) for pid, c in remaining
+                if not self._is_non_contributor(c)
+            ]
+            if contributors:
+                opt_peer_id, opt_conn = random.choice(contributors)
                 if opt_conn.am_choking:
                     opt_conn.send_unchoke()
                 new_unchoked.add(opt_peer_id)
                 self.optimistic_peer = opt_peer_id
+            else:
+                self.optimistic_peer = None
         elif self.optimistic_peer:
             opt_peer_id = self.optimistic_peer
             if opt_peer_id in [p[0] for p in interested_peers]:
                 opt_conn = next(p[1] for p in interested_peers if p[0] == opt_peer_id)
-                if opt_conn.am_choking:
-                    opt_conn.send_unchoke()
-                new_unchoked.add(opt_peer_id)
+                if not self._is_non_contributor(opt_conn):
+                    if opt_conn.am_choking:
+                        opt_conn.send_unchoke()
+                    new_unchoked.add(opt_peer_id)
 
         for peer_id, conn in interested_peers:
             if peer_id not in new_unchoked and not conn.am_choking:

@@ -160,7 +160,8 @@ def cmd_seed(args):
             download_dir=args.download_dir,
             source_filepath=source_path,
             seed=True,
-            free_rider=args.free_rider
+            free_rider=args.free_rider,
+            upload_limit=args.upload_limit
         )
     except Exception as e:
         print(f"Error starting seeder: {e}")
@@ -173,6 +174,7 @@ def cmd_seed(args):
     print(f"\n✓ All pieces verified, ready to seed")
     print(f"  Listening on {args.host}:{peer.get_listen_port()}")
     print(f"  Peer ID: {peer.peer_id.hex()}")
+    print(f"  Upload limit: {format_size(args.upload_limit)}/s per peer")
     print("\nPress Ctrl+C to stop...\n")
 
     stop_event = threading.Event()
@@ -225,7 +227,8 @@ def cmd_download(args):
             download_dir=args.download_dir,
             source_filepath=None,
             seed=False,
-            free_rider=args.free_rider
+            free_rider=args.free_rider,
+            upload_limit=args.upload_limit
         )
     except Exception as e:
         print(f"Error starting downloader: {e}")
@@ -233,6 +236,7 @@ def cmd_download(args):
 
     print(f"\n  Listening on {args.host}:{peer.get_listen_port()}")
     print(f"  Peer ID: {peer.peer_id.hex()}")
+    print(f"  Upload limit: {format_size(args.upload_limit)}/s per peer")
 
     if peer.piece_manager:
         d, t = peer.piece_manager.progress()
@@ -357,8 +361,10 @@ Examples:
     seed_parser.add_argument('--port', type=int, default=0, help='Port to listen on (default: random)')
     seed_parser.add_argument('--download-dir', default='./downloads',
                              help='Download directory (default: ./downloads)')
+    seed_parser.add_argument('--upload-limit', type=int, default=200 * 1024,
+                             help='Upload rate limit per peer in bytes/s (default: 204800)')
     seed_parser.add_argument('--free-rider', action='store_true',
-                             help='Run as free-rider (upload limited to 1KB/s)')
+                             help='Run as free-rider (upload limited to 512B/s)')
 
     download_parser = subparsers.add_parser('download', help='Download a file')
     download_parser.add_argument('torrent', help='Path to the .torrent file')
@@ -366,12 +372,14 @@ Examples:
     download_parser.add_argument('--port', type=int, default=0, help='Port to listen on (default: random)')
     download_parser.add_argument('--download-dir', default='./downloads',
                                  help='Download directory (default: ./downloads)')
+    download_parser.add_argument('--upload-limit', type=int, default=200 * 1024,
+                                 help='Upload rate limit per peer in bytes/s (default: 204800)')
     download_parser.add_argument('--seed-after-complete', action='store_true', default=True,
                                  help='Continue seeding after download completes (default: yes)')
     download_parser.add_argument('--no-seed', action='store_false', dest='seed_after_complete',
                                  help='Stop after download completes, do not seed')
     download_parser.add_argument('--free-rider', action='store_true',
-                                 help='Run as free-rider (upload limited to 1KB/s)')
+                                 help='Run as free-rider (upload limited to 512B/s)')
 
     status_parser = subparsers.add_parser('status', help='Show status')
     status_parser.add_argument('--tracker', help='Tracker URL to query')

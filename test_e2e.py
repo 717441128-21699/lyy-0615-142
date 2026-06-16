@@ -2,7 +2,6 @@
 import os
 import sys
 import time
-import shutil
 import tempfile
 import hashlib
 import threading
@@ -11,8 +10,8 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from tracker import TrackerServer
-from peer import Peer
-from piece_manager import load_torrent_file
+from peer import Peer, DEFAULT_UPLOAD_LIMIT, FREE_RIDER_UPLOAD_LIMIT
+from piece_manager import PieceManager, save_torrent_file, load_torrent_file
 
 
 def file_hash(filepath: str) -> str:
@@ -26,8 +25,20 @@ def file_hash(filepath: str) -> str:
     return h.hexdigest()
 
 
+def format_size(n: int) -> str:
+    if n < 1024:
+        return f"{n} B"
+    elif n < 1024 * 1024:
+        return f"{n / 1024:.1f} KB"
+    else:
+        return f"{n / (1024 * 1024):.1f} MB"
+
+
+def format_rate(rate: float) -> str:
+    return f"{format_size(int(rate))}/s"
+
+
 def test_1_any_path_seeding():
-    """Test 1: Seeding from arbitrary path"""
     print("\n" + "=" * 60)
     print("TEST 1: Seeding from arbitrary path")
     print("=" * 60)
@@ -39,88 +50,70 @@ def test_1_any_path_seeding():
         source_dir.mkdir()
         source_file = source_dir / "test_data.bin"
 
-        download_dir1 = tmpdir / "download1"
-        download_dir1.mkdir()
+        download_dir = tmpdir / "download"
+        download_dir.mkdir()
 
         data = os.urandom(2 * 1024 * 1024)
         with open(source_file, 'wb') as f:
             f.write(data)
 
         original_hash = hashlib.sha256(data).hexdigest()
-        print(f"  Created source file: {source_file} ({len(data)} bytes)")
-        print(f"  Source file SHA256: {original_hash[:16]}...")
+        print(f"  Source: {source_file} ({len(data)} bytes)")
 
-        from piece_manager import PieceManager, save_torrent_file
         torrent_info = PieceManager.create_torrent_from_file(str(source_file), piece_size=256 * 1024)
         torrent_file = tmpdir / "test.torrent"
-        save_torrent_file(torrent_info, str(torrent_file), tracker_url="http://localhost:8888/announce")
-        print(f"  Created torrent: {torrent_file}")
+        save_torrent_file(torrent_info, str(torrent_file), tracker_url="http://localhost:30001/announce")
 
-        tracker = TrackerServer(host='127.0.0.1', port=8888)
+        tracker = TrackerServer(host='127.0.0.1', port=30001)
         tracker.start(daemon=True)
-        time.sleep(0.5)
+        time.sleep(0.3)
 
         seeder = Peer.from_torrent_file(
-            str(torrent_file),
-            host='127.0.0.1',
-            port=8889,
-            download_dir=str(download_dir1),
-            source_filepath=str(source_file),
-            seed=True
+            str(torrent_file), host='127.0.0.1', port=30002,
+            download_dir=str(download_dir),
+            source_filepath=str(source_file), seed=True,
+            upload_limit=DEFAULT_UPLOAD_LIMIT
         )
         seeder.start()
-        time.sleep(0.5)
-        print(f"  Seeder started on port {seeder.get_listen_port()}")
+        time.sleep(0.3)
 
         leecher = Peer.from_torrent_file(
-            str(torrent_file),
-            host='127.0.0.1',
-            port=8890,
-            download_dir=str(download_dir1),
-            source_filepath=None,
-            seed=False
+            str(torrent_file), host='127.0.0.1', port=30003,
+            download_dir=str(download_dir), source_filepath=None, seed=False
         )
         leecher.start()
-        time.sleep(0.5)
-        print(f"  Leecher started on port {leecher.get_listen_port()}")
+        time.sleep(0.3)
 
-        max_wait = 60
         start_time = time.time()
-        while not leecher.is_complete() and time.time() - start_time < max_wait:
-            time.sleep(1)
+        while not leecher.is_complete() and time.time() - start_time < 60:
+            time.sleep(0.5)
             d, t = leecher.get_progress()
             print(f"\r  Progress: {d}/{t} pieces ({d/t*100:.1f}%)", end='', flush=True)
-
         print()
 
+        result = False
         if leecher.is_complete():
-            downloaded_file = download_dir1 / torrent_info.filename
+            downloaded_file = download_dir / torrent_info.filename
             if downloaded_file.exists():
                 downloaded_hash = file_hash(str(downloaded_file))
                 if downloaded_hash == original_hash:
-                    print("  ✓ Downloaded file matches original!")
                     print("  ✓ Arbitrary path seeding works correctly")
                     result = True
                 else:
-                    print(f"  ✗ Hash mismatch! Expected {original_hash[:16]}..., got {downloaded_hash[:16]}...")
-                    result = False
+                    print(f"  ✗ Hash mismatch!")
             else:
-                print(f"  ✗ Downloaded file not found: {downloaded_file}")
-                result = False
+                print(f"  ✗ Downloaded file not found")
         else:
             print("  ✗ Download timed out")
-            result = False
 
         leecher.stop()
         seeder.stop()
         tracker.stop()
-        time.sleep(0.5)
-
+        time.sleep(0.3)
         return result
 
 
 def test_2_fast_resume():
-    """Test 2: Pause and resume (fast resume)"""
     print("\n" + "=" * 60)
     print("TEST 2: Fast Resume - Pause and Continue")
     print("=" * 60)
@@ -139,34 +132,26 @@ def test_2_fast_resume():
         original_hash = hashlib.sha256(data).hexdigest()
         print(f"  Created test file: {len(data)} bytes")
 
-        from piece_manager import PieceManager, save_torrent_file
         torrent_info = PieceManager.create_torrent_from_file(str(source_file), piece_size=256 * 1024)
         torrent_file = tmpdir / "test.torrent"
-        save_torrent_file(torrent_info, str(torrent_file), tracker_url="http://localhost:8889/announce")
+        save_torrent_file(torrent_info, str(torrent_file), tracker_url="http://localhost:30011/announce")
 
-        tracker = TrackerServer(host='127.0.0.1', port=8889)
+        tracker = TrackerServer(host='127.0.0.1', port=30011)
         tracker.start(daemon=True)
-        time.sleep(0.5)
+        time.sleep(0.3)
 
         seeder = Peer.from_torrent_file(
-            str(torrent_file),
-            host='127.0.0.1',
-            port=8891,
+            str(torrent_file), host='127.0.0.1', port=30012,
             download_dir=str(download_dir),
-            source_filepath=str(source_file),
-            seed=True
+            source_filepath=str(source_file), seed=True,
+            upload_limit=DEFAULT_UPLOAD_LIMIT
         )
         seeder.start()
-        time.sleep(0.5)
+        time.sleep(0.3)
 
-        leecher_port = 8892
         leecher1 = Peer.from_torrent_file(
-            str(torrent_file),
-            host='127.0.0.1',
-            port=leecher_port,
-            download_dir=str(download_dir),
-            source_filepath=None,
-            seed=False
+            str(torrent_file), host='127.0.0.1', port=30013,
+            download_dir=str(download_dir), source_filepath=None, seed=False
         )
         leecher1.start()
         print(f"  Leecher started (first run)")
@@ -174,75 +159,62 @@ def test_2_fast_resume():
         start_time = time.time()
         while True:
             d, t = leecher1.get_progress()
-            if d >= t // 2 or time.time() - start_time > 30:
+            if d >= t // 2 or time.time() - start_time > 60:
                 break
             time.sleep(0.5)
 
         pieces_after_first = leecher1.get_progress()[0]
         print(f"  Stopping after {pieces_after_first}/{torrent_info.num_pieces} pieces...")
         leecher1.stop()
-        time.sleep(1)
+        time.sleep(0.5)
 
         print(f"  Restarting leecher (same download dir)...")
         leecher2 = Peer.from_torrent_file(
-            str(torrent_file),
-            host='127.0.0.1',
-            port=leecher_port,
-            download_dir=str(download_dir),
-            source_filepath=None,
-            seed=False
+            str(torrent_file), host='127.0.0.1', port=30013,
+            download_dir=str(download_dir), source_filepath=None, seed=False
         )
 
         pieces_on_restart = leecher2.get_progress()[0]
-        print(f"  Fast resume detected: {pieces_on_restart}/{torrent_info.num_pieces} pieces already verified")
+        print(f"  Fast resume: {pieces_on_restart}/{torrent_info.num_pieces} pieces already verified")
 
-        if pieces_on_restart >= pieces_after_first - 1:
-            print("  ✓ Fast resume working correctly!")
-        else:
+        if pieces_on_restart < pieces_after_first - 1:
             print(f"  ✗ Fast resume failed: expected ~{pieces_after_first}, got {pieces_on_restart}")
-            leecher2.stop()
             seeder.stop()
             tracker.stop()
             return False
 
+        print("  ✓ Fast resume working correctly!")
         leecher2.start()
-        print(f"  Continuing download...")
 
-        max_wait = 60
         start_time = time.time()
-        while not leecher2.is_complete() and time.time() - start_time < max_wait:
-            time.sleep(1)
+        while not leecher2.is_complete() and time.time() - start_time < 60:
+            time.sleep(0.5)
             d, t = leecher2.get_progress()
             print(f"\r  Progress: {d}/{t} pieces ({d/t*100:.1f}%)", end='', flush=True)
-
         print()
 
+        result = False
         if leecher2.is_complete():
             downloaded_file = download_dir / torrent_info.filename
             downloaded_hash = file_hash(str(downloaded_file))
             if downloaded_hash == original_hash:
-                print("  ✓ Downloaded file matches original!")
                 print("  ✓ Fast resume works correctly")
                 result = True
             else:
                 print("  ✗ Hash mismatch after resume!")
-                result = False
         else:
             print("  ✗ Download timed out after resume")
-            result = False
 
         leecher2.stop()
         seeder.stop()
         tracker.stop()
-        time.sleep(0.5)
-
+        time.sleep(0.3)
         return result
 
 
 def test_3_tit_for_tat():
-    """Test 3: Tit-for-Tat - Free-rider penalty"""
     print("\n" + "=" * 60)
-    print("TEST 3: Tit-for-Tat Incentive Mechanism")
+    print("TEST 3: Tit-for-Tat / Free-rider Penalty")
     print("=" * 60)
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -250,171 +222,170 @@ def test_3_tit_for_tat():
 
         source_file = tmpdir / "test_data.bin"
 
-        download_dir_normal = tmpdir / "download_normal"
-        download_dir_freerider = tmpdir / "download_freerider"
-        download_dir_normal.mkdir()
-        download_dir_freerider.mkdir()
+        dl_n1 = tmpdir / "dl_normal1"
+        dl_n2 = tmpdir / "dl_normal2"
+        dl_fr = tmpdir / "dl_freerider"
+        dl_n1.mkdir()
+        dl_n2.mkdir()
+        dl_fr.mkdir()
 
-        data = os.urandom(4 * 1024 * 1024)
+        data = os.urandom(8 * 1024 * 1024)
         with open(source_file, 'wb') as f:
             f.write(data)
 
         original_hash = hashlib.sha256(data).hexdigest()
-        print(f"  Created test file: {len(data)} bytes")
+        print(f"  File: {len(data)} bytes")
+        print(f"  Scenario: 1 seeder + 2 normal peers + 1 free-rider")
 
-        from piece_manager import PieceManager, save_torrent_file
+        upload_cap = 100 * 1024
+        print(f"  Upload cap per peer: {format_size(upload_cap)}/s")
+        print(f"  Free-rider upload limit: {format_size(FREE_RIDER_UPLOAD_LIMIT)}/s")
+
         torrent_info = PieceManager.create_torrent_from_file(str(source_file), piece_size=128 * 1024)
         torrent_file = tmpdir / "test.torrent"
-        save_torrent_file(torrent_info, str(torrent_file), tracker_url="http://localhost:8890/announce")
+        save_torrent_file(torrent_info, str(torrent_file), tracker_url="http://localhost:30021/announce")
 
-        tracker = TrackerServer(host='127.0.0.1', port=8890)
+        tracker = TrackerServer(host='127.0.0.1', port=30021)
         tracker.start(daemon=True)
-        time.sleep(0.5)
-
-        print(f"  Creating scenario: 1 seeder + 2 normal peers + 1 free-rider")
-        print(f"  Normal peers contribute upload, free-rider upload limited to 1KB/s")
+        time.sleep(0.3)
 
         seeder = Peer.from_torrent_file(
-            str(torrent_file),
-            host='127.0.0.1',
-            port=8893,
-            download_dir=str(download_dir_normal),
-            source_filepath=str(source_file),
-            seed=True
+            str(torrent_file), host='127.0.0.1', port=30022,
+            download_dir=str(dl_n1),
+            source_filepath=str(source_file), seed=True,
+            upload_limit=upload_cap
         )
         seeder.start()
-        time.sleep(0.5)
-
-        normal_peer1 = Peer.from_torrent_file(
-            str(torrent_file),
-            host='127.0.0.1',
-            port=8894,
-            download_dir=str(download_dir_normal),
-            source_filepath=None,
-            seed=False,
-            free_rider=False
-        )
-        normal_peer1.start()
         time.sleep(0.3)
 
-        normal_peer2 = Peer.from_torrent_file(
-            str(torrent_file),
-            host='127.0.0.1',
-            port=8896,
-            download_dir=str(download_dir_normal),
-            source_filepath=None,
-            seed=False,
-            free_rider=False
+        normal1 = Peer.from_torrent_file(
+            str(torrent_file), host='127.0.0.1', port=30023,
+            download_dir=str(dl_n1), source_filepath=None, seed=False,
+            free_rider=False, upload_limit=upload_cap
         )
-        normal_peer2.start()
-        time.sleep(0.3)
+        normal1.start()
+        time.sleep(0.2)
 
-        freerider_peer = Peer.from_torrent_file(
-            str(torrent_file),
-            host='127.0.0.1',
-            port=8895,
-            download_dir=str(download_dir_freerider),
-            source_filepath=None,
-            seed=False,
-            free_rider=True
+        normal2 = Peer.from_torrent_file(
+            str(torrent_file), host='127.0.0.1', port=30024,
+            download_dir=str(dl_n2), source_filepath=None, seed=False,
+            free_rider=False, upload_limit=upload_cap
         )
-        freerider_peer.start()
+        normal2.start()
+        time.sleep(0.2)
+
+        freerider = Peer.from_torrent_file(
+            str(torrent_file), host='127.0.0.1', port=30025,
+            download_dir=str(dl_fr), source_filepath=None, seed=False,
+            free_rider=True, upload_limit=upload_cap
+        )
+        freerider.start()
         time.sleep(0.5)
 
-        print(f"  Seeder:          port {seeder.get_listen_port()}")
-        print(f"  Normal peer 1:   port {normal_peer1.get_listen_port()}")
-        print(f"  Normal peer 2:   port {normal_peer2.get_listen_port()}")
-        print(f"  Free-rider peer: port {freerider_peer.get_listen_port()}")
-        print(f"  Downloading... (measuring speed difference for 25 seconds)")
+        print(f"  Seeder:       port {seeder.get_listen_port()}")
+        print(f"  Normal 1:     port {normal1.get_listen_port()}")
+        print(f"  Normal 2:     port {normal2.get_listen_port()}")
+        print(f"  Free-rider:   port {freerider.get_listen_port()}")
+        print()
 
-        normal1_progress = []
-        normal2_progress = []
-        freerider_progress = []
+        measure_secs = 30
         normal1_rates = []
         normal2_rates = []
-        freerider_rates = []
+        fr_rates = []
+        n1_progress = []
+        n2_progress = []
+        fr_progress = []
 
-        for i in range(25):
+        for i in range(measure_secs):
             time.sleep(1)
 
-            n1d, n1t = normal_peer1.get_progress()
-            n2d, n2t = normal_peer2.get_progress()
-            fd, ft = freerider_peer.get_progress()
+            n1s = normal1.get_status()
+            n2s = normal2.get_status()
+            frs = freerider.get_status()
 
-            normal1_progress.append(n1d)
-            normal2_progress.append(n2d)
-            freerider_progress.append(fd)
+            n1r = n1s.get('download_rate', 0)
+            n2r = n2s.get('download_rate', 0)
+            frr = frs.get('download_rate', 0)
 
-            n1_status = normal_peer1.get_status()
-            n2_status = normal_peer2.get_status()
-            f_status = freerider_peer.get_status()
+            normal1_rates.append(n1r)
+            normal2_rates.append(n2r)
+            fr_rates.append(frr)
 
-            normal1_rates.append(n1_status.get('download_rate', 0))
-            normal2_rates.append(n2_status.get('download_rate', 0))
-            freerider_rates.append(f_status.get('download_rate', 0))
+            n1d, n1t = normal1.get_progress()
+            n2d, n2t = normal2.get_progress()
+            frd, frt = freerider.get_progress()
+            n1_progress.append(n1d)
+            n2_progress.append(n2d)
+            fr_progress.append(frd)
 
-            print(f"\r  {i+1}s: N1={n1d}/{n1t} ({n1_status.get('download_rate', 0):.0f}B/s) "
-                  f"N2={n2d}/{n2t} ({n2_status.get('download_rate', 0):.0f}B/s) "
-                  f"FR={fd}/{ft} ({f_status.get('download_rate', 0):.0f}B/s)",
-                  end='', flush=True)
+            print(f"\r  {i+1:2d}s | N1: {n1d:2d}/{n1t} {format_rate(n1r):>12s} "
+                  f"| N2: {n2d:2d}/{n2t} {format_rate(n2r):>12s} "
+                  f"| FR: {frd:2d}/{frt} {format_rate(frr):>12s}", end='', flush=True)
 
-            if normal_peer1.is_complete() and normal_peer2.is_complete() and freerider_peer.is_complete():
+            if normal1.is_complete() and normal2.is_complete() and freerider.is_complete():
                 break
 
         print()
 
         n1_avg = sum(normal1_rates) / len(normal1_rates) if normal1_rates else 0
         n2_avg = sum(normal2_rates) / len(normal2_rates) if normal2_rates else 0
-        fr_avg = sum(freerider_rates) / len(freerider_rates) if freerider_rates else 0
-
+        fr_avg = sum(fr_rates) / len(fr_rates) if fr_rates else 0
         normal_avg = (n1_avg + n2_avg) / 2
-        n1_final = normal1_progress[-1] if normal1_progress else 0
-        n2_final = normal2_progress[-1] if normal2_progress else 0
-        fr_final = freerider_progress[-1] if freerider_progress else 0
-        total_pieces = n1t
 
-        print(f"\n  Results after {len(normal1_rates)} seconds:")
-        print(f"    Normal peer 1: {n1_final}/{total_pieces} pieces, avg rate: {n1_avg:.0f} B/s")
-        print(f"    Normal peer 2: {n2_final}/{total_pieces} pieces, avg rate: {n2_avg:.0f} B/s")
-        print(f"    Free-rider:    {fr_final}/{total_pieces} pieces, avg rate: {fr_avg:.0f} B/s")
-        print(f"    Normal avg:    {normal_avg:.0f} B/s")
+        n1_final = n1_progress[-1] if n1_progress else 0
+        n2_final = n2_progress[-1] if n2_progress else 0
+        fr_final = fr_progress[-1] if fr_progress else 0
+        total_pieces = torrent_info.num_pieces
+
+        print(f"\n  Results:")
+        print(f"    Normal 1:    {n1_final}/{total_pieces} pieces, avg rate: {format_rate(n1_avg)}")
+        print(f"    Normal 2:    {n2_final}/{total_pieces} pieces, avg rate: {format_rate(n2_avg)}")
+        print(f"    Free-rider:  {fr_final}/{total_pieces} pieces, avg rate: {format_rate(fr_avg)}")
+        print(f"    Normal avg:  {format_rate(normal_avg)}")
 
         result = True
-        if normal_avg > 0:
-            ratio = normal_avg / max(fr_avg, 1)
-            print(f"    Speed ratio (normal/free-rider): {ratio:.1f}x")
 
-            if ratio >= 1.5:
-                print("  ✓ Tit-for-Tat working: Normal peers get significantly better speed!")
-            else:
-                print(f"  ⚠ Speed difference not very large ({ratio:.1f}x)")
-
-            n1_file = download_dir_normal / torrent_info.filename
-            n2_file = download_dir_normal / torrent_info.filename
-            fr_file = download_dir_freerider / torrent_info.filename
-
-            for name, peer, filepath in [
-                ("Normal peer 1", normal_peer1, n1_file),
-                ("Normal peer 2", normal_peer2, n2_file),
-                ("Free-rider", freerider_peer, fr_file)
-            ]:
-                if peer.is_complete() and filepath.exists():
-                    h = file_hash(str(filepath))
-                    if h == original_hash:
-                        print(f"  ✓ {name}: file verified correctly")
-                    else:
-                        print(f"  ✗ {name}: hash mismatch!")
-                        result = False
-        else:
-            print("  ⚠ No download activity detected")
+        if normal_avg <= 0:
+            print("  ✗ FAIL: No download activity on normal peers")
             result = False
+        else:
+            ratio = normal_avg / max(fr_avg, 1)
+            print(f"    Speed ratio (normal/fr): {ratio:.1f}x")
 
-        normal_peer1.stop()
-        normal_peer2.stop()
-        freerider_peer.stop()
+            normal_pieces_avg = (n1_final + n2_final) / 2
+            pieces_ratio = normal_pieces_avg / max(fr_final, 1)
+            print(f"    Pieces ratio (normal/fr): {pieces_ratio:.1f}x")
+
+            if ratio < 1.5 and pieces_ratio < 1.3:
+                print("  ✗ FAIL: Speed difference not significant (ratio < 1.5x, pieces ratio < 1.3x)")
+                result = False
+            elif ratio < 1.5:
+                print(f"  ⚠ WARN: Speed ratio only {ratio:.1f}x, but pieces ratio {pieces_ratio:.1f}x is OK")
+            else:
+                print("  ✓ PASS: Normal peers significantly faster than free-rider")
+
+        for name, peer, dl_dir in [
+            ("Normal 1", normal1, dl_n1),
+            ("Normal 2", normal2, dl_n2),
+            ("Free-rider", freerider, dl_fr),
+        ]:
+            filepath = dl_dir / torrent_info.filename
+            if peer.is_complete() and filepath.exists():
+                h = file_hash(str(filepath))
+                if h == original_hash:
+                    print(f"  ✓ {name}: file verified")
+                else:
+                    print(f"  ✗ {name}: hash mismatch!")
+                    result = False
+            elif not peer.is_complete():
+                print(f"  - {name}: not yet complete ({peer.get_progress()[0]}/{total_pieces} pieces)")
+
+        normal1.stop()
+        normal2.stop()
+        freerider.stop()
         seeder.stop()
         tracker.stop()
-        time.sleep(0.5)
+        time.sleep(0.3)
 
         return result
 
